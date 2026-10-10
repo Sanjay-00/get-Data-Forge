@@ -41,4 +41,4 @@ Table extraction works out of the box for any PDF with a text layer. Scanned or 
 
 ## Tech
 
-Python, Streamlit, pandas, openpyxl/xlsxwriter for Excel I/O, pdfplumber and img2table for PDF table extraction.
+Python, Streamlit, pandas. Excel files are read with fastexcel and python-calamine (Rust-based, with openpyxl/xlrd/pyxlsb as fallbacks) and written by a built-in streaming .xlsx writer. PDF tables are extracted with pdfplumber and img2table.
