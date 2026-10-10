@@ -1,6 +1,9 @@
+import functools
+import gc
 import io
 import os
 import shutil
+import threading
 
 import pandas as pd
 
@@ -8,12 +11,18 @@ import pandas as pd
 # stream, Tabula's lattice vs stream): one engine for tables whose structure
 # is drawn (ruling lines / cell borders, handles merged+spanning cells) and
 # one for tables whose structure is implied by text alignment only.
-#   auto  -> img2table (OpenCV line detection on a rendered page image,
+#   auto  -> text-first: pdfplumber on vector ruling lines when the PDF has
+#            a text layer and no merged cells; otherwise img2table (OpenCV
+#            line detection on a rendered page image,
 #            duplicates spanned cells across their range, finds titles),
 #            falling back to the pdfplumber strategies if it finds nothing
 #   lines -> pdfplumber, columns/rows from vector ruling lines in the PDF
 #   text  -> pdfplumber, columns/rows guessed from word-edge alignment
 ENGINES = ("auto", "lines", "text")
+
+# See _extract_with_img2table: PDFium is not thread safe.
+_PDFIUM_LOCK = threading.Lock()
+_IMG2TABLE_BATCH_PAGES = 4
 
 _PDFPLUMBER_SETTINGS = {
     "lines": {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
@@ -73,51 +82,95 @@ def _scan_text(pdf_bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page_count = len(pdf.pages)
         for page in pdf.pages:
-            if (page.extract_text() or "").strip():
+            found = bool((page.extract_text() or "").strip())
+            page.close()
+            if found:
                 has_any_text = True
                 break
     return page_count, has_any_text
 
 
 def _extract_with_pdfplumber(pdf_bytes, settings):
+    return _extract_with_pdfplumber_spans(pdf_bytes, settings)[0]
+
+
+def _extract_with_pdfplumber_spans(pdf_bytes, settings):
+    """(tables, has_spans). pdfplumber reports a cell covered by a merged
+    (spanning) cell as None rather than "", which is how has_spans is
+    detected: those tables read better through img2table, which copies the
+    spanned value across its range."""
     import pdfplumber
 
     tables = []
+    has_spans = False
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pno, page in enumerate(pdf.pages, start=1):
             for tno, raw in enumerate(page.extract_tables(settings)):
+                has_spans = has_spans or any(c is None for row in raw for c in row)
                 rows = _clean_rows(raw)
                 if rows:
                     tables.append({"page": pno, "index": tno, "rows": rows, "title": None})
-    return tables
+            # Frees the page's parsed characters/lines; otherwise pdfplumber
+            # keeps every page's layout objects until the document closes.
+            page.close()
+    return tables, has_spans
 
 
-def _extract_with_img2table(pdf_bytes, use_ocr=False):
+@functools.lru_cache(maxsize=2)
+def _ocr_engine(backend):
+    """One OCR engine per backend for the whole process: building RapidOCR
+    loads its ONNX models from disk (seconds, and ~100 MB), which used to
+    happen again on every OCR run."""
+    if backend == "rapidocr":
+        from img2table.ocr.rapidocr import RapidOCR
+
+        return RapidOCR()
+    from img2table.ocr import TesseractOCR
+
+    return TesseractOCR(n_threads=1, lang="eng")
+
+
+def _extract_with_img2table(pdf_bytes, use_ocr=False, page_count=None):
+    """img2table renders pages with pypdfium2 (PDFium), which is not thread
+    safe, and every Streamlit session runs in its own thread. Two visitors
+    extracting at once, or PDFium objects finalized by garbage collection
+    on another thread, can crash the whole server process with an access
+    violation (reproduced while testing). All PDFium work is therefore
+    serialized behind one lock, and garbage is collected before the lock
+    is released so no PDFium object is left to be finalized elsewhere.
+
+    Pages are processed in small batches: img2table renders every page of
+    the document it's given to an image up front (~11 MB per page at its
+    200 dpi), so a 50 page scan held ~550 MB at once; batching caps that."""
     from img2table.document import PDF
 
-    ocr = None
-    if use_ocr:
-        if ocr_backend() == "rapidocr":
-            from img2table.ocr.rapidocr import RapidOCR
+    ocr = _ocr_engine(ocr_backend()) if use_ocr else None
+    if page_count:
+        batches = [list(range(s, min(s + _IMG2TABLE_BATCH_PAGES, page_count)))
+                   for s in range(0, page_count, _IMG2TABLE_BATCH_PAGES)]
+    else:
+        batches = [None]
 
-            ocr = RapidOCR()
-        else:
-            from img2table.ocr import TesseractOCR
-
-            ocr = TesseractOCR(n_threads=1, lang="eng")
-    doc = PDF(pdf_bytes, detect_rotation=use_ocr, pdf_text_extraction=not use_ocr)
-    extracted = doc.extract_tables(
-        ocr=ocr, implicit_rows=False, implicit_columns=False, borderless_tables=True,
-    )
     tables = []
-    for pno, page_tables in extracted.items():
-        for tno, t in enumerate(page_tables):
-            # t.df's column labels are just 0..n ints; the real header text is
-            # in the data rows, which keeps the "first row is header" option
-            # behaving identically across engines.
-            rows = _clean_rows(t.df.values.tolist())
-            if rows:
-                tables.append({"page": pno + 1, "index": tno, "rows": rows, "title": t.title})
+    for pages in batches:
+        with _PDFIUM_LOCK:
+            try:
+                doc = PDF(pdf_bytes, pages=pages, detect_rotation=use_ocr, pdf_text_extraction=not use_ocr)
+                extracted = doc.extract_tables(
+                    ocr=ocr, implicit_rows=False, implicit_columns=False, borderless_tables=True,
+                )
+                del doc
+            finally:
+                gc.collect()
+        # Keys are absolute 0-based page numbers, even for a batch.
+        for pno, page_tables in extracted.items():
+            for tno, t in enumerate(page_tables):
+                # t.df's column labels are just 0..n ints; the real header text is
+                # in the data rows, which keeps the "first row is header" option
+                # behaving identically across engines.
+                rows = _clean_rows(t.df.values.tolist())
+                if rows:
+                    tables.append({"page": pno + 1, "index": tno, "rows": rows, "title": t.title})
     return tables
 
 
@@ -144,19 +197,29 @@ def extract_pdf_tables(pdf_bytes, engine="auto", use_ocr=False):
                     "OCR requested but no OCR backend is available. "
                     "Install one with: pip install rapidocr onnxruntime"
                 )
-            return _extract_with_img2table(pdf_bytes, use_ocr=True), page_count, has_any_text, None
+            return _extract_with_img2table(pdf_bytes, use_ocr=True, page_count=page_count), page_count, has_any_text, None
 
         if engine in _PDFPLUMBER_SETTINGS:
             return _extract_with_pdfplumber(pdf_bytes, _PDFPLUMBER_SETTINGS[engine]), page_count, has_any_text, None
 
-        # auto: grid detection first; it wins on merged/spanning cells and
-        # multi-line headers. Only fall back when it finds nothing at all.
+        # auto, text-first: a PDF with a text layer and drawn ruling lines is
+        # read straight from its vector lines (pdfplumber), which is 4-10x
+        # faster than rendering every page to an image for img2table and
+        # gave identical rows on plain bordered tables. img2table still
+        # handles everything that path can't: merged/spanning cells (it
+        # copies the spanned value across its range), borderless tables
+        # (no ruling lines, so pdfplumber finds nothing), and scans.
+        line_tables = []
+        if has_any_text:
+            line_tables, has_spans = _extract_with_pdfplumber_spans(pdf_bytes, _PDFPLUMBER_SETTINGS["lines"])
+            if line_tables and not has_spans:
+                return line_tables, page_count, has_any_text, None
         try:
-            tables = _extract_with_img2table(pdf_bytes)
+            tables = _extract_with_img2table(pdf_bytes, page_count=page_count)
         except Exception:
             tables = []
         if not tables:
-            tables = _extract_with_pdfplumber(pdf_bytes, _PDFPLUMBER_SETTINGS["lines"])
+            tables = line_tables or _extract_with_pdfplumber(pdf_bytes, _PDFPLUMBER_SETTINGS["lines"])
         if not tables:
             tables = _extract_with_pdfplumber(pdf_bytes, _PDFPLUMBER_SETTINGS["text"])
         return tables, page_count, has_any_text, None
