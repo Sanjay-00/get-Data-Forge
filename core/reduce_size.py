@@ -1,8 +1,85 @@
 import io
+import posixpath
+import re
 import zipfile
 
-import openpyxl
 import pandas as pd
+
+_SHEET_RE = re.compile(rb'<(?:\w+:)?sheet\b[^>]*?\bname="([^"]*)"[^>]*?\br:id="([^"]+)"')
+_SHEET_RE_ALT = re.compile(rb'<(?:\w+:)?sheet\b[^>]*?\br:id="([^"]+)"[^>]*?\bname="([^"]*)"')
+_REL_RE = re.compile(rb'<(?:\w+:)?Relationship\b[^>]*?\bId="([^"]+)"[^>]*?\bTarget="([^"]+)"')
+_REL_RE_ALT = re.compile(rb'<(?:\w+:)?Relationship\b[^>]*?\bTarget="([^"]+)"[^>]*?\bId="([^"]+)"')
+_DEFINED_NAME_RE = re.compile(rb"<(?:\w+:)?definedName\b")
+_DIMENSION_RE = re.compile(rb'<(?:\w+:)?dimension\b[^>]*?\bref="([^"]+)"')
+# Main-namespace rules only (unprefixed or "x:"), the same set openpyxl
+# counted; x14 extension rules live in extLst under "x14:cfRule".
+_CF_RULE_RE = re.compile(rb"<(?:x:)?cfRule[\s/>]")
+_CELL_REF_RE = re.compile(r"([A-Z]+)(\d+)")
+
+
+def _unescape_attr(raw):
+    from xml.sax.saxutils import unescape
+    return unescape(raw.decode("utf-8"), {"&quot;": '"', "&apos;": "'"})
+
+
+def _sheet_part_path(zf, sheet_name):
+    """Zip path of the worksheet XML for sheet_name (first sheet if None or
+    not found), resolved through workbook.xml and its relationships."""
+    workbook = zf.read("xl/workbook.xml")
+    sheets = [(_unescape_attr(n), rid) for n, rid in _SHEET_RE.findall(workbook)]
+    sheets += [(_unescape_attr(n), rid) for rid, n in _SHEET_RE_ALT.findall(workbook)]
+    if not sheets:
+        return None
+    rid = next((r for n, r in sheets if n == sheet_name), sheets[0][1])
+    rels = zf.read("xl/_rels/workbook.xml.rels")
+    targets = dict(_REL_RE.findall(rels))
+    targets.update({i: t for t, i in _REL_RE_ALT.findall(rels)})
+    target = targets.get(rid)
+    if target is None:
+        return None
+    target = target.decode("utf-8")
+    return target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
+
+
+def _col_number(letters):
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def _scan_sheet(zf, path):
+    """(conditional format rule count, (rows, cols) or None), streamed in
+    1 MB chunks so a sheet that decompresses to hundreds of MB is never
+    held in memory at once."""
+    cf_rules = 0
+    used_range = None
+    tail = b""
+    with zf.open(path) as fh:
+        first = True
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            data = tail + chunk
+            if first:
+                m = _DIMENSION_RE.search(data)
+                if m:
+                    cells = _CELL_REF_RE.findall(m.group(1).decode("ascii").upper())
+                    if cells:
+                        letters, row = cells[-1]
+                        used_range = (int(row), _col_number(letters))
+                first = False
+            # Count matches that *start* before the last `keep` bytes, searching
+            # the whole buffer so a match crossing that line is still seen;
+            # the last `keep` bytes (longer than any match) carry over, so a
+            # match split across two reads is counted exactly once.
+            keep = 16
+            cutoff = max(len(data) - keep, 0)
+            cf_rules += sum(1 for m in _CF_RULE_RE.finditer(data) if m.start() < cutoff)
+            tail = data[cutoff:]
+        cf_rules += len(_CF_RULE_RE.findall(tail))
+    return cf_rules, used_range
 
 
 def drop_empty_columns(df):
@@ -69,14 +146,13 @@ def inspect_workbook_bloat(raw_bytes, filename, sheet_name=None):
         result["image_total_bytes"] = sum(zf.getinfo(n).file_size for n in image_names)
         result["has_pivot_cache"] = any(n.startswith("xl/pivotCache/") for n in names)
 
-        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=False)
-        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
-        result["defined_names"] = len(wb.defined_names)
-        try:
-            result["conditional_formats"] = sum(len(cf.rules) for cf in ws.conditional_formatting)
-        except Exception:
-            result["conditional_formats"] = 0
-        result["used_range"] = (ws.max_row, ws.max_column)
+        # Counted straight from the package XML. Loading the workbook with
+        # openpyxl for these few numbers took ~25s and over 1 GB of RAM on
+        # a 200k row sheet, on every rerun of the page.
+        result["defined_names"] = len(_DEFINED_NAME_RE.findall(zf.read("xl/workbook.xml")))
+        sheet_path = _sheet_part_path(zf, sheet_name)
+        if sheet_path and sheet_path in names:
+            result["conditional_formats"], result["used_range"] = _scan_sheet(zf, sheet_path)
     except Exception as e:
         result["error"] = str(e)
 
