@@ -1,7 +1,13 @@
 streamlit==1.59.2
 pandas>=2.2.0
+# Fast Rust-based Excel reader (xlsx/xls/xlsb); pandas falls back to
+# openpyxl/xlrd/pyxlsb below for any file it can't parse.
+python-calamine>=0.8.3
+# Calamine -> Arrow reader used first for single-type sheets (3x faster than
+# python-calamine, half the peak memory); converts to pandas via pyarrow,
+# which Streamlit already depends on.
+fastexcel>=0.21.0
 openpyxl>=3.1.2
-xlsxwriter>=3.2.0
 xlrd>=2.0.1
 pyxlsb>=1.0.10
 pdfplumber>=0.11.0
