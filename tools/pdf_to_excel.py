@@ -1,6 +1,7 @@
 import streamlit as st
 
 from core.excel_writer import tables_to_excel_bytes, to_excel_bytes
+from core.memory import release_memory
 from core.pdf_extract import (
     coerce_numeric_columns,
     extract_pdf_tables,
@@ -8,8 +9,8 @@ from core.pdf_extract import (
     rows_to_dataframe,
     stack_tables,
 )
-from core.session import ns_key
-from ui.shared import render_success_banner, render_tool_hero, section_label
+from core.session import file_key, ns_key, release_unused_uploads, remember_cache_entry
+from ui.shared import render_download_section, render_success_banner, render_tool_hero, section_label
 
 TOOL = "pdf"
 
@@ -17,17 +18,18 @@ PREVIEW_ROW_CAP = 50
 
 
 ENGINE_LABELS = {
-    "Auto (grid detection, recommended)": "auto",
+    "Auto (recommended)": "auto",
     "Vector ruling lines only": "lines",
     "Text alignment only (borderless tables)": "text",
 }
 
 
-@st.cache_data(show_spinner=False)
-def _cached_extract(pdf_bytes, filename, engine, use_ocr=False):
-    # filename is unused in the body on purpose: it participates in the
-    # cache key (same convention as core.session.cached_read).
-    return extract_pdf_tables(pdf_bytes, engine=engine, use_ocr=use_ocr)
+@st.cache_resource(scope="session", max_entries=4, ttl="1h", show_spinner=False)
+def _cached_extract(key, engine, use_ocr, _pdf_bytes):
+    # Keyed on the upload's file_key rather than hashing the whole PDF on
+    # every rerun; session-scoped and bounded so extracted tables don't
+    # outlive the visitor. The result is shared, so callers only read it.
+    return extract_pdf_tables(_pdf_bytes, engine=engine, use_ocr=use_ocr)
 
 
 def render_pdf_page():
@@ -38,6 +40,7 @@ def render_pdf_page():
         accept_multiple_files=False, label_visibility="collapsed",
         key=ns_key(TOOL, "uploader"),
     )
+    release_unused_uploads(uploaded_file)
 
     if not uploaded_file:
         st.stop()
@@ -45,14 +48,16 @@ def render_pdf_page():
     engine_label = st.selectbox(
         "Table detection engine", options=list(ENGINE_LABELS),
         key=ns_key(TOOL, "engine"),
-        help="Auto detects drawn cell grids first (best for merged/spanning cells and "
-             "multi-line headers) and falls back to text-layer detection. Pick a "
-             "specific engine if Auto splits or misses your table.",
+        help="Auto reads bordered tables straight from the PDF's ruling lines (fast), "
+             "and switches to image-based grid detection for merged/spanning cells, "
+             "borderless tables and scans. Pick a specific engine if Auto splits or "
+             "misses your table.",
     )
     engine = ENGINE_LABELS[engine_label]
 
     with st.spinner(f"Scanning {uploaded_file.name} for tables..."):
-        tables, page_count, has_any_text, err = _cached_extract(uploaded_file.getvalue(), uploaded_file.name, engine)
+        remember_cache_entry(file_key(uploaded_file), _cached_extract, file_key(uploaded_file), engine, False, None)
+        tables, page_count, has_any_text, err = _cached_extract(file_key(uploaded_file), engine, False, uploaded_file.getvalue())
 
     if err:
         st.error(f"Cannot read PDF: {err}")
@@ -75,8 +80,9 @@ def render_pdf_page():
             if not run_ocr:
                 st.stop()
             with st.spinner("Running OCR - this can take a while on multi-page scans..."):
+                remember_cache_entry(file_key(uploaded_file), _cached_extract, file_key(uploaded_file), engine, True, None)
                 tables, page_count, has_any_text, err = _cached_extract(
-                    uploaded_file.getvalue(), uploaded_file.name, engine, use_ocr=True,
+                    file_key(uploaded_file), engine, True, uploaded_file.getvalue(),
                 )
             if err:
                 st.error(f"OCR failed: {err}")
@@ -152,7 +158,7 @@ def render_pdf_page():
             )
             if len(df) > PREVIEW_ROW_CAP:
                 st.caption(f"Showing first {PREVIEW_ROW_CAP} of {len(df):,} rows.")
-            st.dataframe(df.head(PREVIEW_ROW_CAP), use_container_width=True, hide_index=True)
+            st.dataframe(df.head(PREVIEW_ROW_CAP), width="stretch", hide_index=True)
         if include:
             selected.append((label, df, raw_df))
 
@@ -164,7 +170,7 @@ def render_pdf_page():
         st.stop()
 
     current_sig = (
-        uploaded_file.name, engine, ocr_used, first_row_header, coerce_numeric, output_mode,
+        file_key(uploaded_file), engine, ocr_used, first_row_header, coerce_numeric, output_mode,
         tuple(label for label, _, _ in selected),
     )
     if st.session_state.get(ns_key(TOOL, "last_sig")) != current_sig:
@@ -172,7 +178,7 @@ def render_pdf_page():
         st.session_state[ns_key(TOOL, "last_sig")] = current_sig
 
     # ── Convert ──────────────────────────────────────────────────────────────
-    if st.button("Convert to Excel", type="primary", use_container_width=True, key=ns_key(TOOL, "convert_btn")):
+    if st.button("Convert to Excel", type="primary", width="stretch", key=ns_key(TOOL, "convert_btn")):
         try:
             if output_mode == "Stack all tables into one sheet":
                 # Stack the raw all-text fragments, then coerce the combined
@@ -208,6 +214,8 @@ def render_pdf_page():
         st.session_state[ns_key(TOOL, "excel_bytes")] = excel_bytes
         st.session_state[ns_key(TOOL, "total_rows")] = total_rows
         st.session_state[ns_key(TOOL, "pdf_done")] = True
+        del excel_bytes
+        release_memory()
 
     # ── Results ──────────────────────────────────────────────────────────────
     if st.session_state.get(ns_key(TOOL, "pdf_done")):
@@ -215,13 +223,10 @@ def render_pdf_page():
         k1.metric("Tables Exported", len(selected))
         k2.metric("Total Rows", f"{st.session_state[ns_key(TOOL, 'total_rows')]:,}")
         with k3:
-            st.markdown("<div style='height:0.85rem'></div>", unsafe_allow_html=True)
-            st.download_button(
-                label="Download pdf_tables.xlsx",
-                data=st.session_state[ns_key(TOOL, "excel_bytes")],
-                file_name="pdf_tables.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key=ns_key(TOOL, "download_btn"),
+            render_download_section(
+                TOOL,
+                "pdf_tables.xlsx",
+                st.session_state[ns_key(TOOL, "excel_bytes")],
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         render_success_banner("Conversion complete")

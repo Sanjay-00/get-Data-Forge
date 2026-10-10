@@ -1,4 +1,72 @@
+import os
+import re
+
 import streamlit as st
+
+from core.schema import similarity
+from core.session import ns_key
+
+# An unmatched column is preselected onto its closest reference column only
+# when the names are genuinely alike; anything weaker defaults to "Leave as
+# null" so an unrelated extra column can't silently land in a real column.
+AUTO_MAP_MIN_SIMILARITY = 0.6
+
+_BAD_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+
+
+@st.fragment
+def render_download_section(tool, default_filename, data, mime):
+    """Rename field + download button. Blank rename field falls back to
+    default_filename; a typed name keeps the original extension unless the
+    user already typed one.
+
+    A fragment, so typing a new name reruns only this block instead of the
+    whole tool page; on_click="ignore" means the download click itself
+    doesn't rerun anything. data may be bytes, or a zero-argument callable
+    that builds them only when the button is clicked."""
+    _, ext = os.path.splitext(default_filename)
+    custom_name = st.text_input(
+        "Rename file (optional)",
+        value="",
+        placeholder=default_filename,
+        key=ns_key(tool, "rename_input"),
+    ).strip()
+    custom_name = _BAD_FILENAME_CHARS.sub("_", custom_name).strip(" .")
+
+    if custom_name:
+        _, custom_ext = os.path.splitext(custom_name)
+        file_name = custom_name if custom_ext else f"{custom_name}{ext}"
+    else:
+        file_name = default_filename
+
+    # Always hand Streamlit a callable: given raw bytes, it hashes them and
+    # stores a second copy in its media store on every rerun, whether or not
+    # anyone clicks. A callable is only run (and stored) on click.
+    payload = data if callable(data) else (lambda: data)
+
+    st.download_button(
+        label=f"Download {file_name}",
+        data=payload,
+        file_name=file_name,
+        mime=mime,
+        on_click="ignore",
+        width="stretch",
+        key=ns_key(tool, "download_btn"),
+    )
+
+
+def stop_on_duplicate_names(uploaded_files):
+    """Files are tracked by name (cached reads, sheet maps, widget keys), so
+    two uploads sharing a name would silently overwrite each other."""
+    names = [f.name for f in uploaded_files]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        st.error(
+            f"Two or more uploaded files share the same name ({', '.join(duplicates)}). "
+            "Files are tracked by name, so duplicates would silently overwrite each "
+            "other. Rename one of the files and re-upload."
+        )
+        st.stop()
 
 
 def section_label(title, badge=None, badge_color=None):
@@ -68,7 +136,8 @@ def render_unmatched_ui(all_unmatched, key_prefix="map"):
     with st.expander(f"Resolve {total} unmatched columns", expanded=False):
         st.markdown(
             '<span style="color:var(--eq-text-secondary);font-size:0.75rem;">'
-            'Map file columns to reference columns or leave as null.</span>',
+            'Map file columns to reference columns or leave as null. Close matches are '
+            'preselected; anything else defaults to null.</span>',
             unsafe_allow_html=True,
         )
         for unit_label, pairs in all_unmatched.items():
@@ -87,9 +156,10 @@ def render_unmatched_ui(all_unmatched, key_prefix="map"):
                     )
                 with col_r:
                     options = ["Leave as null"] + rc_options
+                    confident = similarity(fc, rc_options[0]) >= AUTO_MAP_MIN_SIMILARITY
                     match = st.selectbox(
                         f"{fc}", options=options,
-                        index=1, key=f"{key_prefix}_{unit_label}_{fc}",
+                        index=1 if confident else 0, key=f"{key_prefix}_{unit_label}_{fc}",
                         label_visibility="collapsed",
                     )
                 if match != "Leave as null":

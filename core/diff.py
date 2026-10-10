@@ -1,6 +1,7 @@
+import numpy as np
 import pandas as pd
 
-from core.schema import _normalize_columns, get_unmatched_pairs
+from core.schema import get_unmatched_pairs, normalized_columns
 
 
 def diff_columns(df_a, df_b):
@@ -9,22 +10,36 @@ def diff_columns(df_a, df_b):
     renamed header is treated as the same column rather than a false
     added+removed pair.
 
-    Returns (result, normalized_df_b) where result has keys:
+    Returns (result, normalized_b_columns) where result has keys:
       added, removed, common: sorted lists of column names
-      unmatched_pairs: output of get_unmatched_pairs(normalized_df_b, cols_a) - columns still ambiguous after normalization, for manual resolution.
+      unmatched_pairs: output of get_unmatched_pairs on the normalized B
+        columns - columns still ambiguous after normalization, for manual
+        resolution.
+    normalized_b_columns is df_b's column list after normalization, in
+    order; apply it with with_columns() only when rows are actually needed,
+    so the column-level view never copies df_b.
     """
     cols_a = list(df_a.columns)
-    normalized_b = _normalize_columns(df_b, cols_a)
-    cols_b = list(normalized_b.columns)
+    cols_b = normalized_columns(list(df_b.columns), cols_a)
 
     set_a, set_b = set(cols_a), set(cols_b)
     result = {
         "added": sorted(set_b - set_a),
         "removed": sorted(set_a - set_b),
         "common": sorted(set_a & set_b),
-        "unmatched_pairs": get_unmatched_pairs(normalized_b, cols_a),
+        # get_unmatched_pairs only reads the column labels
+        "unmatched_pairs": get_unmatched_pairs(pd.DataFrame(columns=cols_b), cols_a),
     }
-    return result, normalized_b
+    return result, cols_b
+
+
+def with_columns(df, columns):
+    """df relabelled to `columns` (same length, same order). If two labels
+    collide (two B columns resolved onto one A column), the first wins,
+    the same rule Merge/Concat alignment uses."""
+    out = df.set_axis(columns, axis=1)
+    mask = out.columns.duplicated()
+    return out.loc[:, ~mask] if mask.any() else out
 
 
 def _values_equal(x, y):
@@ -45,6 +60,24 @@ def _values_equal(x, y):
     return str(x).strip() == str(y).strip()
 
 
+def _equal_mask(a, b):
+    """Vectorized _values_equal over two aligned columns. Strict equality
+    and both-blank are settled for the whole column at once; only the
+    (usually few) remaining cells go through the lenient per-value check,
+    so the result is identical to calling _values_equal on every pair."""
+    try:
+        equal = (a == b).fillna(False).to_numpy(dtype=bool)
+    except (TypeError, ValueError):
+        equal = np.zeros(len(a), dtype=bool)
+    equal |= (a.isna() & b.isna()).to_numpy()
+    pending = (~equal).nonzero()[0]
+    if len(pending):
+        a_vals, b_vals = a.to_numpy(dtype=object), b.to_numpy(dtype=object)
+        for i in pending:
+            equal[i] = _values_equal(a_vals[i], b_vals[i])
+    return equal
+
+
 def diff_rows(df_a, df_b_normalized, key_columns, common_columns):
     """Row-level diff, matched by key_columns identity (not full-row hash or
     position). common_columns is the set of non-added/removed columns to
@@ -61,8 +94,9 @@ def diff_rows(df_a, df_b_normalized, key_columns, common_columns):
     """
     compare_cols = [c for c in common_columns if c not in key_columns]
 
-    a = df_a[key_columns + compare_cols].copy()
-    b = df_b_normalized[key_columns + compare_cols].copy()
+    # Column selection already returns new frames; no extra .copy() needed.
+    a = df_a[key_columns + compare_cols]
+    b = df_b_normalized[key_columns + compare_cols]
 
     dup_a = a[a.duplicated(subset=key_columns, keep=False)][key_columns].drop_duplicates()
     dup_b = b[b.duplicated(subset=key_columns, keep=False)][key_columns].drop_duplicates()
@@ -73,22 +107,21 @@ def diff_rows(df_a, df_b_normalized, key_columns, common_columns):
     added = merged[merged["_merge"] == "right_only"][key_columns + [f"{c}_B" for c in compare_cols]]
     both = merged[merged["_merge"] == "both"]
 
-    changed_rows = []
-    unchanged_count = 0
-    for _, row in both.iterrows():
-        diff_cols = [c for c in compare_cols if not _values_equal(row[f"{c}_A"], row[f"{c}_B"])]
-        if diff_cols:
-            record = row.to_dict()
-            record["Changed Columns"] = ", ".join(diff_cols)
-            changed_rows.append(record)
-        else:
-            unchanged_count += 1
+    changed_flags = {
+        c: ~_equal_mask(both[f"{c}_A"], both[f"{c}_B"]) for c in compare_cols
+    }
+    if changed_flags:
+        flags = np.column_stack([changed_flags[c] for c in compare_cols])
+        row_changed = flags.any(axis=1)
+    else:
+        flags = np.zeros((len(both), 0), dtype=bool)
+        row_changed = np.zeros(len(both), dtype=bool)
 
-    changed = pd.DataFrame(changed_rows) if changed_rows else pd.DataFrame(
-        columns=list(both.columns) + ["Changed Columns"]
-    )
-    if "_merge" in changed.columns:
-        changed = changed.drop(columns=["_merge"])
+    changed = both.loc[row_changed].drop(columns=["_merge"])
+    changed["Changed Columns"] = [
+        ", ".join(c for c, f in zip(compare_cols, row) if f) for row in flags[row_changed]
+    ]
+    unchanged_count = int((~row_changed).sum())
 
     return {
         "added": added.reset_index(drop=True),

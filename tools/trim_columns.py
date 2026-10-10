@@ -2,9 +2,10 @@ import pandas as pd
 import streamlit as st
 
 from core.excel_writer import to_excel_bytes
-from core.session import cached_read, cached_sheet_names, ns_key
+from core.memory import release_memory
+from core.session import cached_read, cached_sheet_names, file_key, ns_key, release_unused_uploads
 from core.trim import DEFAULT_PUNCTUATION, apply_trim_operations, build_trim_preview
-from ui.shared import render_success_banner, render_tool_hero, section_label
+from ui.shared import render_download_section, render_success_banner, render_tool_hero, section_label
 
 TOOL = "trim"
 
@@ -17,18 +18,19 @@ def render_trim_page():
         accept_multiple_files=False, label_visibility="collapsed",
         key=ns_key(TOOL, "uploader"),
     )
+    release_unused_uploads(uploaded_file)
 
     if not uploaded_file:
         st.stop()
 
     with st.spinner(f"Reading {uploaded_file.name}..."):
-        sheets = cached_sheet_names(uploaded_file.getvalue(), uploaded_file.name)
+        sheets = cached_sheet_names(uploaded_file)
     sheet_choice = 0
     if len(sheets) > 1:
         sheet_choice = st.selectbox("Sheet", options=sheets, index=0, key=ns_key(TOOL, "sheet"))
 
     with st.spinner("Reading sheet data..."):
-        df, err = cached_read(uploaded_file.getvalue(), uploaded_file.name, sheet_choice)
+        df, err = cached_read(uploaded_file, sheet_choice)
     if err:
         st.error(f"Cannot read file: {err}")
         st.stop()
@@ -42,11 +44,11 @@ def render_trim_page():
     section_label("Columns to Keep", f"{len(df.columns)} columns available", "#D97706")
     btn_all, btn_none, _ = st.columns([1, 1, 4])
     with btn_all:
-        if st.button("Select all", key=ns_key(TOOL, "select_all_cols"), use_container_width=True):
+        if st.button("Select all", key=ns_key(TOOL, "select_all_cols"), width="stretch"):
             st.session_state[ns_key(TOOL, "keep_columns")] = list(df.columns)
             st.rerun()
     with btn_none:
-        if st.button("Clear all", key=ns_key(TOOL, "clear_all_cols"), use_container_width=True):
+        if st.button("Clear all", key=ns_key(TOOL, "clear_all_cols"), width="stretch"):
             st.session_state[ns_key(TOOL, "keep_columns")] = []
             st.rerun()
 
@@ -142,7 +144,7 @@ def render_trim_page():
                 "Newly Empty": r["newly_empty"],
                 "Skipped (non-string column)": "Yes" if r["skipped_non_string"] else "No",
             })
-        st.dataframe(pd.DataFrame(report_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(report_rows), width="stretch", hide_index=True)
 
         if any(change_report[c]["skipped_non_string"] for c in cleaned_columns):
             skipped = [c for c in cleaned_columns if change_report[c]["skipped_non_string"]]
@@ -162,21 +164,32 @@ def render_trim_page():
         if cleaned_columns:
             st.info("No changes to preview with the current selection.")
     else:
-        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+        st.dataframe(preview_df, width="stretch", hide_index=True)
 
-    if st.button("Apply and Prepare Download", type="primary", use_container_width=True, key=ns_key(TOOL, "apply_btn")):
+    # Any change to the selections invalidates a prepared download; without
+    # this, editing columns or operations after "Apply" kept serving the
+    # old file.
+    current_sig = (
+        file_key(uploaded_file), sheet_choice, tuple(keep_columns), tuple(cleaned_columns), tuple(operations),
+        punctuation_chars if do_punctuation else None, case_mode if do_case else None,
+    )
+    if st.session_state.get(ns_key(TOOL, "last_sig")) != current_sig:
+        st.session_state[ns_key(TOOL, "trim_done")] = False
+        st.session_state[ns_key(TOOL, "last_sig")] = current_sig
+
+    if st.button("Apply and Prepare Download", type="primary", width="stretch", key=ns_key(TOOL, "apply_btn")):
         with st.spinner("Writing cleaned file..."):
             excel_bytes = to_excel_bytes(new_df)
         st.session_state[ns_key(TOOL, "excel_bytes")] = excel_bytes
         st.session_state[ns_key(TOOL, "trim_done")] = True
+        del excel_bytes
+        release_memory()
 
     if st.session_state.get(ns_key(TOOL, "trim_done")):
-        st.download_button(
-            label="Download trimmed_output.xlsx",
-            data=st.session_state[ns_key(TOOL, "excel_bytes")],
-            file_name="trimmed_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key=ns_key(TOOL, "download_btn"),
+        render_download_section(
+            TOOL,
+            "trimmed_output.xlsx",
+            st.session_state[ns_key(TOOL, "excel_bytes")],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         render_success_banner("Trim complete")

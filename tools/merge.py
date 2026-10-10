@@ -1,10 +1,12 @@
 import pandas as pd
 import streamlit as st
 
-from core.excel_writer import to_excel_bytes
+from core.excel_writer import frames_to_excel_bytes
+from core.memory import release_memory
 from core.schema import align_to_schema, build_file_summary, detect_dtype_mismatches, get_unmatched_pairs
-from core.session import cached_read, cached_sheet_names, ns_key
+from core.session import cached_read_many, cached_sheet_names, file_key, ns_key, release_unused_uploads
 from ui.shared import (
+    render_download_section,
     render_dropped_columns_warning,
     render_dtype_mismatch_warning,
     render_success_banner,
@@ -12,7 +14,10 @@ from ui.shared import (
     render_tool_hero,
     render_unmatched_ui,
     section_label,
+    stop_on_duplicate_names,
 )
+
+PREVIEW_ROWS = 100
 
 TOOL = "merge"
 
@@ -25,6 +30,7 @@ def render_merge_page():
         accept_multiple_files=True, label_visibility="collapsed",
         key=ns_key(TOOL, "uploader"),
     )
+    release_unused_uploads(*(uploaded_files or []))
 
     # ── Summary bar ──────────────────────────────────────────────────────
     if uploaded_files:
@@ -33,23 +39,11 @@ def render_merge_page():
     if not uploaded_files:
         st.stop()
 
-    # Files are tracked internally by name (file_data, sheet maps, session-state
-    # widget keys) -- two uploads sharing a name would silently overwrite each
-    # other with no visible error, since Streamlit's uploader doesn't prevent
-    # duplicate filenames in one multi-upload.
-    names = [f.name for f in uploaded_files]
-    if len(names) != len(set(names)):
-        duplicates = sorted({n for n in names if names.count(n) > 1})
-        st.error(
-            f"Two or more uploaded files share the same name ({', '.join(duplicates)}). "
-            "Files are tracked by name, so duplicates would silently overwrite each "
-            "other. Rename one of the files and re-upload."
-        )
-        st.stop()
+    stop_on_duplicate_names(uploaded_files)
 
     # ── Per-file sheet selection ──────────────────────────────────────────
     with st.spinner("Detecting sheets..."):
-        all_sheet_names = {f.name: cached_sheet_names(f.getvalue(), f.name) for f in uploaded_files}
+        all_sheet_names = {f.name: cached_sheet_names(f) for f in uploaded_files}
 
     has_multi_sheets = any(len(sheets) > 1 for sheets in all_sheet_names.values())
 
@@ -76,13 +70,15 @@ def render_merge_page():
     warnings = []
     progress = st.progress(0, text="Analyzing files...")
 
-    for i, f in enumerate(uploaded_files):
-        progress.progress(
-            int((i + 1) / len(uploaded_files) * 100),
-            text=f"Reading {f.name} ({i + 1} of {len(uploaded_files)})"
-        )
-        df, err = cached_read(f.getvalue(), f.name, file_sheet_map[f.name])
-        file_data[f.name] = (df, err)
+    def read_progress(done, total):
+        progress.progress(int(done / total * 100), text=f"Reading files ({done} of {total})")
+
+    # New uploads are parsed in parallel; already-parsed ones come from cache.
+    results = cached_read_many(
+        [(f, file_sheet_map[f.name]) for f in uploaded_files], progress_cb=read_progress,
+    )
+    for f, result in zip(uploaded_files, results):
+        file_data[f.name] = result
 
     progress.empty()
 
@@ -121,11 +117,6 @@ def render_merge_page():
         with st.expander(f"{ref_name}", expanded=False):
             st.write(reference_cols)
 
-    current_sig = (tuple(f.name for f in uploaded_files), ref_name, str(file_sheet_map))
-    if st.session_state.get(ns_key(TOOL, "last_file_sig")) != current_sig:
-        st.session_state[ns_key(TOOL, "merge_done")] = False
-        st.session_state[ns_key(TOOL, "last_file_sig")] = current_sig
-
     # ── File summary ────────────────────────────────────────────────────────
     section_label("File Summary", f"{len(uploaded_files)} files", "#0EA5E9")
 
@@ -144,7 +135,7 @@ def render_merge_page():
     for w in warnings:
         st.warning(f"Could not read **{w}**")
 
-    st.dataframe(pd.DataFrame(summaries), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(summaries), width="stretch", hide_index=True)
 
     # ── Unmatched column resolution ─────────────────────────────────────────
     all_unmatched = {}
@@ -161,8 +152,20 @@ def render_merge_page():
 
     manual_maps = render_unmatched_ui(all_unmatched, key_prefix=ns_key(TOOL, "map")) if all_unmatched else {}
 
+    # Any input that changes the merged output invalidates a finished merge,
+    # including the column mappings above (changing one after merging used
+    # to keep showing and serving the old result). file_key, not just the
+    # name, so re-uploading a different file under the same name counts.
+    current_sig = (
+        tuple(file_key(f) for f in uploaded_files), ref_name, str(file_sheet_map),
+        repr(sorted((k, sorted(v.items())) for k, v in manual_maps.items())),
+    )
+    if st.session_state.get(ns_key(TOOL, "last_file_sig")) != current_sig:
+        st.session_state[ns_key(TOOL, "merge_done")] = False
+        st.session_state[ns_key(TOOL, "last_file_sig")] = current_sig
+
     # ── Merge ────────────────────────────────────────────────────────────────
-    if st.button("Merge Files", type="primary", use_container_width=True, key=ns_key(TOOL, "merge_btn")):
+    if st.button("Merge Files", type="primary", width="stretch", key=ns_key(TOOL, "merge_btn")):
         frames = []
         errors = []
         dropped_by_file = {}
@@ -190,24 +193,38 @@ def render_merge_page():
         # vanishing while the results and download button persist.
         st.session_state[ns_key(TOOL, "dropped_by_file")] = dropped_by_file
         st.session_state[ns_key(TOOL, "dtype_mismatches")] = detect_dtype_mismatches(frames, reference_cols)
-        merged_df = pd.concat(frames, ignore_index=True)
         merge_progress = st.progress(0, text="Generating Excel file...")
 
         def update_progress(written, total):
             pct = int(written / total * 100)
             merge_progress.progress(pct, text=f"Writing rows {written:,} of {total:,}")
 
-        excel_bytes = to_excel_bytes(merged_df, progress_cb=update_progress)
+        # Frames are streamed into the sheet one after another; a pd.concat
+        # here would hold a second full copy of every file in memory.
+        try:
+            excel_bytes = frames_to_excel_bytes(frames, progress_cb=update_progress)
+        except ValueError as e:
+            merge_progress.empty()
+            st.error(str(e))
+            st.stop()
         merge_progress.empty()
 
-        st.session_state[ns_key(TOOL, "merged_df")] = merged_df
+        # Only what the results view shows is kept per session: the counts
+        # and a small preview, never the full merged frame.
+        st.session_state[ns_key(TOOL, "preview")] = pd.concat(
+            [f.head(PREVIEW_ROWS) for f in frames], ignore_index=True,
+        ).head(PREVIEW_ROWS)
+        st.session_state[ns_key(TOOL, "shape")] = (sum(len(f) for f in frames), len(reference_cols))
+        st.session_state[ns_key(TOOL, "files_merged")] = len(frames)
         st.session_state[ns_key(TOOL, "excel_bytes")] = excel_bytes
         st.session_state[ns_key(TOOL, "merge_done")] = True
         st.session_state[ns_key(TOOL, "merge_errors")] = errors
+        del frames, excel_bytes
+        release_memory()
 
     # ── Results ──────────────────────────────────────────────────────────────
     if st.session_state.get(ns_key(TOOL, "merge_done")):
-        merged_df = st.session_state[ns_key(TOOL, "merged_df")]
+        total_rows, total_cols = st.session_state[ns_key(TOOL, "shape")]
         errors = st.session_state.get(ns_key(TOOL, "merge_errors"), [])
 
         render_dropped_columns_warning(st.session_state.get(ns_key(TOOL, "dropped_by_file"), {}))
@@ -218,21 +235,18 @@ def render_merge_page():
             )
 
         k1, k2, k3, k4 = st.columns([1, 1, 1, 2])
-        k1.metric("Total Rows", f"{len(merged_df):,}")
-        k2.metric("Columns", len(merged_df.columns))
-        k3.metric("Files Merged", len(uploaded_files) - len(errors))
+        k1.metric("Total Rows", f"{total_rows:,}")
+        k2.metric("Columns", total_cols)
+        k3.metric("Files Merged", st.session_state[ns_key(TOOL, "files_merged")])
         with k4:
-            st.markdown("<div style='height:0.85rem'></div>", unsafe_allow_html=True)
-            st.download_button(
-                label="Download merged_output.xlsx",
-                data=st.session_state[ns_key(TOOL, "excel_bytes")],
-                file_name="merged_output.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key=ns_key(TOOL, "download_btn"),
+            render_download_section(
+                TOOL,
+                "merged_output.xlsx",
+                st.session_state[ns_key(TOOL, "excel_bytes")],
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
         render_success_banner()
 
-        with st.expander("Preview, first 100 rows", expanded=True):
-            st.dataframe(merged_df.head(100), use_container_width=True, hide_index=True)
+        with st.expander(f"Preview, first {PREVIEW_ROWS} rows", expanded=True):
+            st.dataframe(st.session_state[ns_key(TOOL, "preview")], width="stretch", hide_index=True)
