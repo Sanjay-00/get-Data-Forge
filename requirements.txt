@@ -1,4 +1,8 @@
 streamlit==1.59.2
+# Streamlit 1.59.2 allows any starlette>=0.40, but its gzip middleware breaks
+# on starlette 1.x: every /media response (logo, download buttons) fails with
+# HTTP 500 ("Expected ASGI message 'http.response.start'"). Keep below 1.0.
+starlette<1.0
 pandas>=2.2.0
 # Fast Rust-based Excel reader (xlsx/xls/xlsb); pandas falls back to
 # openpyxl/xlrd/pyxlsb below for any file it can't parse.
