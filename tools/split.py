@@ -332,7 +332,8 @@ def render_split_page():
                 # Different raw values can sanitize to the same file name
                 # ("A/B" and "A_B"), so names are made unique, not overwritten.
                 file_name = _unique_name(_safe_filename(label), used_names)
-                zf.writestr(f"{file_name}.xlsx", to_excel_bytes(group_df))
+                # Sheet named after the group (safe_sheet_name trims it to Excel's rules).
+                zf.writestr(f"{file_name}.xlsx", to_excel_bytes(group_df, sheet_name=label))
         split_progress.empty()
 
         st.session_state[ns_key(TOOL, "zip_bytes")] = buf.getvalue()

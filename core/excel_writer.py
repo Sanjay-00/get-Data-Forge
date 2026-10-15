@@ -51,7 +51,6 @@ _LOOKS_LIKE_ESCAPE = re.compile(r"_(x[0-9A-Fa-f]{4}_)")
 
 # Lotus 1-2-3 leap year bug: Excel serial 60 is the nonexistent 1900-02-29,
 # so for real dates from 1900-03-01 onward the effective epoch is 1899-12-30.
-_EPOCH = pd.Timestamp("1899-12-30")
 _EPOCH_DT = _dt.datetime(1899, 12, 30)
 
 # cellXfs indexes in _STYLES_XML.
@@ -250,7 +249,15 @@ def _column_cells(series, letter, first_row):
     if kind == "M":
         if getattr(series.dt, "tz", None) is not None:
             series = series.dt.tz_localize(None)
-        serial = ((series - _EPOCH) / pd.Timedelta(days=1)).to_numpy()
+        # From the raw count since 1970 (Excel serial 25569), not by
+        # subtracting the 1899 epoch: that subtraction is a timedelta64[ns],
+        # which only spans ~292 years, so a column mixing old dates with
+        # ones after ~2192 raised OverflowError and no file was written.
+        values = series.to_numpy()
+        unit, _ = np.datetime_data(values.dtype)
+        per_day = {"s": 86_400, "ms": 86_400e3, "us": 86_400e6, "ns": 86_400e9}[unit]
+        serial = values.astype("int64") / per_day + 25569.0
+        serial[np.isnat(values)] = np.nan
         # Dates before 1900-03-01 sit before Excel's phantom 1900-02-29.
         serial = np.where(serial < 61, serial - 1, serial)
         out = []
